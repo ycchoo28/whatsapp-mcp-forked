@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/joho/godotenv"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
 
@@ -431,6 +432,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 	// Skip if there's no content and no media
 	if content == "" && mediaType == "" {
+		fmt.Println("skip le", content, mediaType, msg.Message)
 		return
 	}
 
@@ -467,6 +469,38 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		} else if content != "" {
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
+	}
+
+	// --- Webhook logic ---
+	webhookPayload := map[string]interface{}{
+		"id":         msg.Info.ID,
+		"chat_jid":   chatJID,
+		"sender":     sender,
+		"content":    content,
+		"timestamp":  msg.Info.Timestamp,
+		"is_from_me": msg.Info.IsFromMe,
+		"media_type": mediaType,
+		"filename":   filename,
+		"url":        url,
+	}
+	jsonPayload, err := json.Marshal(webhookPayload)
+	if err != nil {
+		logger.Warnf("Failed to marshal webhook payload: %v", err)
+		return
+	}
+
+	webhookURL := os.Getenv("WEBHOOK_URL")
+	if webhookURL != "" {
+		resp, err := http.Post(webhookURL, "application/json", bytes.NewBuffer(jsonPayload))
+		if err != nil {
+			logger.Warnf("Failed to POST to webhook %s: %v", webhookURL, err)
+		} else {
+			_ = resp.Body.Close()
+			fmt.Println("webhookURL sent", webhookURL)
+			logger.Infof("Sent to webhook %s", webhookURL)
+		}
+	} else {
+		logger.Warnf("WEBHOOK_URL is not set")
 	}
 }
 
@@ -787,6 +821,12 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 }
 
 func main() {
+	// Load .env file
+	err := godotenv.Load()
+	if err != nil {
+		fmt.Println("Warning: .env file not found or failed to load")
+	}
+
 	// Set up logger
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
