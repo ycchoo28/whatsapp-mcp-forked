@@ -44,6 +44,16 @@ Here's an example of what you can do when it's connected to Claude.
 
    After approximately 20 days, you will might need to re-authenticate.
 
+   You can configure the server using environment variables:
+   
+   ```bash
+   # Set a custom port (default is 8080)
+   PORT=3000 go run main.go
+   
+   # Set a webhook URL to receive message notifications
+   WEBHOOK_URL=http://localhost:8000/webhook go run main.go
+   ```
+
 3. **Connect to the MCP server**
 
    Copy the below json with the appropriate {{PATH}} values:
@@ -117,6 +127,28 @@ This application consists of two main components:
 - All message history is stored in a SQLite database within the `whatsapp-bridge/store/` directory
 - The database maintains tables for chats and messages
 - Messages are indexed for efficient searching and retrieval
+
+## REST API
+
+The WhatsApp bridge also provides a REST API that you can use to interact with WhatsApp programmatically:
+
+- **Send Messages**: `POST /api/send` - Send text or media to a recipient
+- **Get Messages**: `GET /api/messages?chat_jid=YOUR_CHAT_JID&limit=10` - Retrieve messages from a specific chat
+- **Download Media**: `POST /api/download` - Download media files from messages
+
+For full API documentation, see [whatsapp-bridge/API.md](whatsapp-bridge/API.md).
+
+The repository includes a test script (`whatsapp-bridge/test_api.sh`) to verify API functionality:
+
+```bash
+cd whatsapp-bridge
+chmod +x test_api.sh
+./test_api.sh
+```
+
+### Using with n8n
+
+The REST API is particularly useful for n8n workflows. You can use the `/api/messages` endpoint to retrieve WhatsApp messages and process them in your automated workflows.
 
 ## Usage
 

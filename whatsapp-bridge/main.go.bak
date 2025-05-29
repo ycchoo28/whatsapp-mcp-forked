@@ -472,12 +472,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		}
 	}
 
-	if msg.Info.IsFromMe {
-		return
-	}
-
 	// --- Webhook logic ---
-	// Only trigger webhook for incoming messages (not from the user)
 	webhookPayload := map[string]interface{}{
 		"id":         msg.Info.ID,
 		"chat_jid":   chatJID,
