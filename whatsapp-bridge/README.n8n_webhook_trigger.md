@@ -18,6 +18,30 @@ This feature allows you to forward every incoming WhatsApp message to an externa
    go run whatsapp-bridge/main.go
    ```
 
+## Whitelist Feature
+The whitelist feature allows you to filter incoming messages based on sender phone numbers:
+
+- When the whitelist is **empty or not set**, messages from all senders are processed.
+- When the whitelist is **configured**, only messages from whitelisted numbers are processed.
+- Messages sent by you (the WhatsApp account owner) are always processed regardless of the whitelist.
+
+### Configuring the Whitelist
+1. Add the `WHATSAPP_WHITELIST` environment variable to your `.env` file:
+   ```
+   WHATSAPP_WHITELIST=1234567890,9876543210
+   ```
+2. Use comma-separated phone numbers without spaces, country code symbols, or formatting.
+3. Each number should be in the same format as it appears in WhatsApp (typically with country code but no + symbol).
+
+### Example
+```sh
+# Empty whitelist - process all messages
+WHATSAPP_WHITELIST=
+
+# Process messages only from these two numbers
+WHATSAPP_WHITELIST=1234567890,9876543210
+```
+
 ## Payload Format
 The webhook will receive a JSON object like this:
 

@@ -43,6 +43,9 @@ type Message struct {
 	Filename  string
 }
 
+// SenderWhitelist holds the list of approved senders
+var SenderWhitelist map[string]bool
+
 // Database handler for storing message history
 type MessageStore struct {
 	db *sql.DB
@@ -415,6 +418,17 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Save message to database
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
+
+	// If whitelist is enabled (non-empty) and this is not from the user,
+	// check if sender is in the whitelist
+	if len(SenderWhitelist) > 0 && !msg.Info.IsFromMe {
+		if !SenderWhitelist[sender] {
+			// Not in whitelist, ignore this message
+			logger.Infof("Ignoring message from non-whitelisted sender: %s", sender)
+			return
+		}
+		logger.Infof("Processing whitelisted message from: %s", sender)
+	}
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
@@ -1036,6 +1050,9 @@ func main() {
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
 
+	// Initialize whitelist from environment variable
+	initWhitelist(logger)
+
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
@@ -1352,6 +1369,16 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					sender = jid.User
 				}
 
+				// If whitelist is enabled (non-empty) and this is not from the user,
+				// check if sender is in the whitelist
+				if len(SenderWhitelist) > 0 && !isFromMe {
+					if !SenderWhitelist[sender] {
+						logger.Infof("Skipping history message from non-whitelisted sender: %s", sender)
+						continue
+					}
+					logger.Infof("Processing history message from whitelisted sender: %s", sender)
+				}
+
 				// Store message
 				msgID := ""
 				if msg.Message.Key != nil && msg.Message.Key.ID != nil {
@@ -1599,4 +1626,31 @@ func placeholderWaveform(duration uint32) []byte {
 	}
 
 	return waveform
+}
+
+// Initialize whitelist from environment variable
+func initWhitelist(logger waLog.Logger) {
+	// Create an empty whitelist map
+	SenderWhitelist = make(map[string]bool)
+
+	// Check for whitelist in environment
+	whitelistStr := os.Getenv("WHATSAPP_WHITELIST")
+	if whitelistStr == "" {
+		// No whitelist defined, process all messages
+		logger.Infof("Whitelist not enabled - processing all messages")
+		return
+	}
+
+	// Split the string by commas
+	whitelist := strings.Split(whitelistStr, ",")
+
+	for _, number := range whitelist {
+		number = strings.TrimSpace(number)
+		if number != "" {
+			SenderWhitelist[number] = true
+			logger.Infof("Added %s to whitelist", number)
+		}
+	}
+
+	logger.Infof("Whitelist enabled: Only processing messages from %d whitelisted numbers", len(SenderWhitelist))
 }
