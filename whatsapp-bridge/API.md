@@ -58,7 +58,35 @@ Send a text message or media file to a WhatsApp recipient.
 - `500 Internal Server Error` - Failed to send message
 - `503 Service Unavailable` - WhatsApp client is not connected
 
-### 2. Get Messages
+### 2. Send Image from URL
+
+Send an image to a WhatsApp recipient by downloading it from a URL.
+
+**Endpoint:** `POST /api/send-image-url`
+
+**Request Body:**
+```json
+{
+  "recipient": "1234567890",   // Phone number or JID (required)
+  "message": "Image caption",   // Caption for the image (optional)
+  "image_url": "https://example.com/image.jpg" // URL of the image to send (required)
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Message sent to 1234567890"
+}
+```
+
+**Error Responses:**
+- `400 Bad Request` - Missing required parameters
+- `500 Internal Server Error` - Failed to download image or send message
+- `503 Service Unavailable` - WhatsApp client is not connected
+
+### 3. Get Messages
 
 Retrieve messages from a specific chat.
 
@@ -113,7 +141,7 @@ GET /api/messages?chat_jid=1234567890@s.whatsapp.net&limit=10
 }
 ```
 
-### 3. Download Media
+### 4. Download Media
 
 Download media from a message.
 

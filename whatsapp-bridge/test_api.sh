@@ -2,10 +2,11 @@
 # Test script for WhatsApp Bridge API
 
 # Configuration
-PORT=${PORT:-8080}  # Use PORT env var if set, otherwise default to 8080
+PORT=8085  # Use PORT env var if set, otherwise default to 8080
 API_BASE="http://localhost:$PORT"
 CONTACT_JID="60124456192@s.whatsapp.net"  # Replace with an actual contact JID
 MESSAGE="Test message from API"
+IMAGE_URL="https://t4.ftcdn.net/jpg/03/60/70/11/360_F_360701167_9dolp6h5cfm5i9uC8QObRzhog1mc1gI0.jpg"
 
 # Color codes for output
 GREEN='\033[0;32m'
@@ -58,5 +59,8 @@ test_endpoint "Send Message" "curl -s -X POST \"$API_BASE/api/send\" -H \"Conten
 
 # Test 5: Send Message with invalid parameters
 test_endpoint "Send Message (Bad Request)" "curl -s -X POST \"$API_BASE/api/send\" -H \"Content-Type: application/json\" -d '{\"message\":\"$MESSAGE\"}'"
+
+# Test 6: Send Image from URL
+test_endpoint "Send Image from URL" "curl -s -X POST \"$API_BASE/api/send-image-url\" -H \"Content-Type: application/json\" -d '{\"recipient\":\"$CONTACT_JID\",\"message\":\"Image sent from URL\",\"image_url\":\"$IMAGE_URL\"}'"
 
 echo -e "${GREEN}All tests completed!${NC}" 

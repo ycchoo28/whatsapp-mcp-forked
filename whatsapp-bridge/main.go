@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"net/http"
@@ -205,6 +206,13 @@ type SendMessageRequest struct {
 	Recipient string `json:"recipient"`
 	Message   string `json:"message"`
 	MediaPath string `json:"media_path,omitempty"`
+}
+
+// SendURLImageRequest represents the request body for sending images via URL
+type SendURLImageRequest struct {
+	Recipient string `json:"recipient"`
+	Message   string `json:"message"`
+	ImageURL  string `json:"image_url"`
 }
 
 // Function to send a WhatsApp message
@@ -803,6 +811,99 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 		// Send the message
 		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+
+		// Set response headers
+		w.Header().Set("Content-Type", "application/json")
+
+		// Set appropriate status code
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+
+		// Send response
+		json.NewEncoder(w).Encode(SendMessageResponse{
+			Success: success,
+			Message: message,
+		})
+	})
+
+	// Handler for sending images from URL
+	http.HandleFunc("/api/send-image-url", func(w http.ResponseWriter, r *http.Request) {
+		// Only allow POST requests
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Check if client is connected to WhatsApp
+		if !client.IsConnected() {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: "WhatsApp client is not connected. Please ensure the service is properly authenticated and connected.",
+			})
+			return
+		}
+
+		// Parse the request body
+		var req SendURLImageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: fmt.Sprintf("Invalid request format: %v", err),
+			})
+			return
+		}
+
+		// Validate request
+		if req.Recipient == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: "Recipient is required",
+			})
+			return
+		}
+
+		if req.ImageURL == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: "Image URL is required",
+			})
+			return
+		}
+
+		logger.Infof("Received request to send image from URL to %s", req.Recipient)
+
+		// Download the image from URL
+		tempFilePath, err := downloadImageFromURL(req.ImageURL)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: fmt.Sprintf("Failed to download image: %v", err),
+			})
+			return
+		}
+
+		// Clean up the temporary file after sending
+		defer func() {
+			if err := os.Remove(tempFilePath); err != nil {
+				logger.Warnf("Failed to remove temporary file %s: %v", tempFilePath, err)
+			} else {
+				logger.Infof("Removed temporary file %s", tempFilePath)
+			}
+		}()
+
+		// Send the message using the existing function
+		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, tempFilePath)
 
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -1653,4 +1754,57 @@ func initWhitelist(logger waLog.Logger) {
 	}
 
 	logger.Infof("Whitelist enabled: Only processing messages from %d whitelisted numbers", len(SenderWhitelist))
+}
+
+// Function to download an image from URL and save it to a temporary file
+func downloadImageFromURL(imageURL string) (string, error) {
+	// Create a temporary directory if it doesn't exist
+	tempDir := filepath.Join("store", "temp_media")
+	if err := os.MkdirAll(tempDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create temp directory: %v", err)
+	}
+
+	// Generate a unique filename based on timestamp and random number
+	timestamp := time.Now().UnixNano()
+	randomNum := rand.Intn(10000)
+	filename := fmt.Sprintf("%d_%d", timestamp, randomNum)
+
+	// Extract file extension from URL
+	urlPath := strings.Split(imageURL, "?")[0] // Remove query parameters
+	ext := filepath.Ext(urlPath)
+
+	if ext == "" {
+		// Default to .jpg if no extension found
+		ext = ".jpg"
+	}
+
+	// Create full temporary file path
+	tempFilePath := filepath.Join(tempDir, filename+ext)
+
+	// Download the file
+	resp, err := http.Get(imageURL)
+	if err != nil {
+		return "", fmt.Errorf("failed to download image: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Check if response is OK
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("failed to download image, status code: %d", resp.StatusCode)
+	}
+
+	// Create the temporary file
+	out, err := os.Create(tempFilePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to create temporary file: %v", err)
+	}
+	defer out.Close()
+
+	// Copy the response body to the file
+	_, err = io.Copy(out, resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to save downloaded image: %v", err)
+	}
+
+	return tempFilePath, nil
 }
