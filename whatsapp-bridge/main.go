@@ -217,7 +217,10 @@ type SendURLImageRequest struct {
 
 // Function to send a WhatsApp message
 func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+	fmt.Println("sendWhatsAppMessage called with:", recipient, message, mediaPath)
+
 	if !client.IsConnected() {
+		fmt.Println("Error: Not connected to WhatsApp")
 		return false, "Not connected to WhatsApp"
 	}
 
@@ -232,6 +235,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Parse the JID string
 		recipientJID, err = types.ParseJID(recipient)
 		if err != nil {
+			fmt.Println("Error parsing JID:", err)
 			return false, fmt.Sprintf("Error parsing JID: %v", err)
 		}
 	} else {
@@ -242,6 +246,8 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		}
 	}
 
+	fmt.Println("Recipient JID:", recipientJID.String())
+
 	msg := &waProto.Message{}
 
 	// Check if we have media to send
@@ -249,6 +255,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Read media file
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
+			fmt.Println("Error reading media file:", err)
 			return false, fmt.Sprintf("Error reading media file: %v", err)
 		}
 
@@ -298,6 +305,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Upload media to WhatsApp servers
 		resp, err := client.Upload(context.Background(), mediaData, mediaType)
 		if err != nil {
+			fmt.Println("Error uploading media:", err)
 			return false, fmt.Sprintf("Error uploading media: %v", err)
 		}
 
@@ -328,6 +336,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 					seconds = analyzedSeconds
 					waveform = analyzedWaveform
 				} else {
+					fmt.Println("Failed to analyze Ogg Opus file:", err)
 					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
 				}
 			} else {
@@ -375,11 +384,33 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	fmt.Println("Sending message to:", recipientJID.String())
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
+		fmt.Println("Error sending message:", err)
 		return false, fmt.Sprintf("Error sending message: %v", err)
 	}
+
+	fmt.Println("Message sent successfully with ID:", resp.ID)
+
+	// Create an events.Message struct for the outgoing message
+	outgoingMsg := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     recipientJID,                  // The recipient is the chat
+				Sender:   client.Store.ID.ToNonAD(),     // Our own JID
+				IsFromMe: true,                          // Mark as sent by us
+				IsGroup:  recipientJID.Server == "g.us", // Check if it's a group
+			},
+			ID:        resp.ID,    // Message ID from the send response
+			Timestamp: time.Now(), // Current time
+		},
+		Message: msg, // The original message object we sent
+	}
+
+	// Manually dispatch the event to trigger the same handlers as incoming messages
+	client.DangerousInternals().DispatchEvent(outgoingMsg)
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
 }
@@ -440,6 +471,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
+	logger.Infof("name", name)
 
 	// Update chat in database with the message timestamp (keeps last message time updated)
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
@@ -458,6 +490,8 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fmt.Println("skip le", content, mediaType, msg.Message)
 		return
 	}
+
+	fmt.Println("processing message", content, mediaType, msg.Message)
 
 	// Store message in database
 	err = messageStore.StoreMessage(
@@ -752,6 +786,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 		// Check if client is connected to WhatsApp
 		if !client.IsConnected() {
+			logger.Warnf("API call failed: WhatsApp client not connected")
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusServiceUnavailable)
 			json.NewEncoder(w).Encode(SendMessageResponse{
@@ -764,6 +799,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		// Parse the request body
 		var req SendMessageRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			logger.Warnf("API call failed: Invalid request format: %v", err)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(SendMessageResponse{
@@ -775,6 +811,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 		// Validate request
 		if req.Recipient == "" {
+			logger.Warnf("API call failed: Recipient is required")
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(SendMessageResponse{
@@ -785,6 +822,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		}
 
 		if req.Message == "" && req.MediaPath == "" {
+			logger.Warnf("API call failed: Message or media path is required")
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(SendMessageResponse{
@@ -797,6 +835,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		// Check media path if specified
 		if req.MediaPath != "" {
 			if _, err := os.Stat(req.MediaPath); os.IsNotExist(err) {
+				logger.Warnf("API call failed: Media file not found: %s", req.MediaPath)
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusBadRequest)
 				json.NewEncoder(w).Encode(SendMessageResponse{
@@ -817,7 +856,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 		// Set appropriate status code
 		if !success {
+			logger.Warnf("Failed to send message: %s", message)
 			w.WriteHeader(http.StatusInternalServerError)
+		} else {
+			logger.Infof("Message sent successfully: %s", message)
 		}
 
 		// Send response

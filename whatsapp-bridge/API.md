@@ -88,7 +88,7 @@ Send an image to a WhatsApp recipient by downloading it from a URL.
 
 ### 3. Get Messages
 
-Retrieve messages from a specific chat.
+Retrieve messages from a specific chat. **Messages are returned in reverse chronological order (latest messages first).**
 
 **Endpoint:** `GET /api/messages`
 
