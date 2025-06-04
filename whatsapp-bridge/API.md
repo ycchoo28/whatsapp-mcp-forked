@@ -171,6 +171,55 @@ Download media from a message.
 - `500 Internal Server Error` - Failed to download media
 - `503 Service Unavailable` - WhatsApp client is not connected
 
+### 5. Get Image as Base64
+
+Retrieve an image file as base64-encoded data.
+
+**Endpoint:** `GET /api/image-base64` or `POST /api/image-base64`
+
+**Parameters:**
+- `chat_jid` (required): The JID of the chat where the image is located
+- `filename` (required): The filename of the image to retrieve (obtained from a previous API call)
+- `delete_after_send` (optional): Set to "true", "1", or "yes" to delete the file after sending the response
+
+**Example:**
+```
+GET /api/image-base64?chat_jid=1234567890@s.whatsapp.net&filename=image_20230715_103045.jpg&delete_after_send=true
+```
+
+**Success Response:**
+```json
+{
+  "success": true,
+  "message": "File successfully encoded to base64",
+  "filename": "image_20230715_103045.jpg",
+  "base64": "iVBORw0KGgoAAAANSUhEUgAA...", 
+  "mime_type": "image/jpeg"
+}
+```
+
+**Error Responses:**
+- `400 Bad Request` - Missing required parameters
+- `404 Not Found` - File not found and unable to locate message in database
+- `500 Internal Server Error` - Failed to download, read, or encode file
+
+**Usage Notes:**
+1. First use `/api/messages` to get a list of messages with media
+2. Identify the image by its filename in the message list
+3. Call this endpoint with the chat_jid and filename to get the base64-encoded image
+4. If the file hasn't been downloaded yet, the endpoint will automatically attempt to download it
+5. The base64 string can be used directly in HTML with the format: `data:{mime_type};base64,{base64}`
+6. When `delete_after_send=true`, the file will be deleted from the server after the response is sent
+7. Files that are automatically downloaded during the request will always be deleted after the response
+
+**Auto-download Feature:**
+The endpoint will:
+1. First check if the file exists locally
+2. If not, it will search the database for the corresponding message ID
+3. Use the message ID to download the media from WhatsApp servers
+4. Return the base64-encoded file data
+5. Automatically delete any files it downloaded (regardless of the delete_after_send parameter)
+
 ## Using with n8n Workflows
 
 The `/api/messages` endpoint is particularly useful for n8n workflows to retrieve WhatsApp messages directly from the backend:

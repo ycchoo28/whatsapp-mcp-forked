@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -213,6 +214,15 @@ type SendURLImageRequest struct {
 	Recipient string `json:"recipient"`
 	Message   string `json:"message"`
 	ImageURL  string `json:"image_url"`
+}
+
+// ImageBase64Response represents the response for the image base64 API
+type ImageBase64Response struct {
+	Success  bool   `json:"success"`
+	Message  string `json:"message"`
+	Filename string `json:"filename,omitempty"`
+	Base64   string `json:"base64,omitempty"`
+	MimeType string `json:"mime_type,omitempty"`
 }
 
 // Function to send a WhatsApp message
@@ -1170,6 +1180,181 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for getting image as base64
+	http.HandleFunc("/api/image-base64", func(w http.ResponseWriter, r *http.Request) {
+		logger.Infof("Received request for /api/image-base64 from %s", r.RemoteAddr)
+
+		// Allow both GET and POST requests
+		if r.Method != http.MethodGet && r.Method != http.MethodPost {
+			logger.Warnf("Method not allowed: %s", r.Method)
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Get parameters either from query string (GET) or request body (POST)
+		var chatJID, filename string
+		var deleteAfterSend bool
+
+		if r.Method == http.MethodGet {
+			chatJID = r.URL.Query().Get("chat_jid")
+			filename = r.URL.Query().Get("filename")
+			deleteParam := r.URL.Query().Get("delete_after_send")
+			deleteAfterSend = deleteParam == "true" || deleteParam == "1" || deleteParam == "yes"
+			logger.Debugf("GET request parameters - chat_jid: %s, filename: %s, delete_after_send: %v", chatJID, filename, deleteAfterSend)
+		} else {
+			// Parse POST body
+			if err := r.ParseForm(); err != nil {
+				logger.Errorf("Failed to parse form data: %v", err)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(ImageBase64Response{
+					Success: false,
+					Message: fmt.Sprintf("Failed to parse form data: %v", err),
+				})
+				return
+			}
+			chatJID = r.FormValue("chat_jid")
+			filename = r.FormValue("filename")
+			deleteParam := r.FormValue("delete_after_send")
+			deleteAfterSend = deleteParam == "true" || deleteParam == "1" || deleteParam == "yes"
+			logger.Debugf("POST request parameters - chat_jid: %s, filename: %s, delete_after_send: %v", chatJID, filename, deleteAfterSend)
+		}
+
+		// Validate parameters
+		if chatJID == "" || filename == "" {
+			logger.Warnf("Missing required parameters - chat_jid: %s, filename: %s", chatJID, filename)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ImageBase64Response{
+				Success: false,
+				Message: "chat_jid and filename are required parameters",
+			})
+			return
+		}
+
+		// Sanitize the chat JID for use in a path
+		sanitizedChatJID := strings.ReplaceAll(chatJID, ":", "_")
+
+		// Construct the path where the file should be
+		chatDir := fmt.Sprintf("store/%s", sanitizedChatJID)
+		filePath := filepath.Join(chatDir, filename)
+		logger.Debugf("Looking for file at path: %s", filePath)
+
+		// Track if the file was downloaded just for this request
+		wasDownloadedForThisRequest := false
+
+		// Check if file exists
+		fileExists := true
+		if _, err := os.Stat(filePath); os.IsNotExist(err) {
+			logger.Warnf("File not found at path: %s, will attempt to download", filePath)
+			fileExists = false
+
+			// Try to find the message ID in the database
+			messageID, err := messageStore.FindMessageIDByFilename(chatJID, filename)
+			if err != nil {
+				logger.Errorf("Failed to find message ID for file %s in chat %s: %v", filename, chatJID, err)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusNotFound)
+				json.NewEncoder(w).Encode(ImageBase64Response{
+					Success: false,
+					Message: fmt.Sprintf("File not found and unable to locate message in database: %v", err),
+				})
+				return
+			}
+
+			logger.Infof("Found message ID %s for file %s, attempting to download", messageID, filename)
+
+			// Try to download the file
+			success, mediaType, _, downloadedPath, err := downloadMedia(client, messageStore, messageID, chatJID)
+			if err != nil || !success {
+				errMsg := "Unknown error"
+				if err != nil {
+					errMsg = err.Error()
+				}
+				logger.Errorf("Failed to download file: %s", errMsg)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(ImageBase64Response{
+					Success: false,
+					Message: fmt.Sprintf("Failed to download file: %s", errMsg),
+				})
+				return
+			}
+
+			logger.Infof("Successfully downloaded file to %s (type: %s)", downloadedPath, mediaType)
+			filePath = downloadedPath
+			fileExists = true
+			wasDownloadedForThisRequest = true
+		}
+
+		// At this point, we should have the file either already existed or was downloaded
+		if !fileExists {
+			logger.Warnf("File still not available after download attempt: %s", filePath)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ImageBase64Response{
+				Success: false,
+				Message: "File could not be retrieved",
+			})
+			return
+		}
+
+		// Read the file
+		fileData, err := os.ReadFile(filePath)
+		if err != nil {
+			logger.Errorf("Failed to read file %s: %v", filePath, err)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ImageBase64Response{
+				Success: false,
+				Message: fmt.Sprintf("Failed to read file: %v", err),
+			})
+			return
+		}
+
+		// Determine MIME type based on file extension
+		fileExt := strings.ToLower(filename[strings.LastIndex(filename, ".")+1:])
+		var mimeType string
+		switch fileExt {
+		case "jpg", "jpeg":
+			mimeType = "image/jpeg"
+		case "png":
+			mimeType = "image/png"
+		case "gif":
+			mimeType = "image/gif"
+		case "webp":
+			mimeType = "image/webp"
+		default:
+			mimeType = "application/octet-stream"
+		}
+		logger.Debugf("Detected MIME type: %s for file extension: %s", mimeType, fileExt)
+
+		// Encode to base64
+		base64Data := base64.StdEncoding.EncodeToString(fileData)
+		logger.Infof("Successfully encoded file %s to base64 (size: %d bytes)", filename, len(base64Data))
+
+		// Return success response with base64 data
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(ImageBase64Response{
+			Success:  true,
+			Message:  "File successfully encoded to base64",
+			Filename: filename,
+			Base64:   base64Data,
+			MimeType: mimeType,
+		})
+		logger.Infof("Successfully responded to request for file %s", filename)
+
+		// Delete the file if requested or if it was downloaded just for this request
+		if deleteAfterSend || wasDownloadedForThisRequest {
+			logger.Infof("Deleting file after sending response: %s", filePath)
+			if err := os.Remove(filePath); err != nil {
+				logger.Errorf("Failed to delete file %s: %v", filePath, err)
+			} else {
+				logger.Infof("Successfully deleted file: %s", filePath)
+			}
+		}
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf("0.0.0.0:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -1849,4 +2034,14 @@ func downloadImageFromURL(imageURL string) (string, error) {
 	}
 
 	return tempFilePath, nil
+}
+
+// Find message ID by chat_jid and filename
+func (store *MessageStore) FindMessageIDByFilename(chatJID string, filename string) (string, error) {
+	var messageID string
+	err := store.db.QueryRow(
+		"SELECT id FROM messages WHERE chat_jid = ? AND filename = ? LIMIT 1",
+		chatJID, filename,
+	).Scan(&messageID)
+	return messageID, err
 }
