@@ -204,6 +204,20 @@ func extractTextContent(msg *waProto.Message) string {
 		return vid.GetCaption()
 	} else if doc := msg.GetDocumentMessage(); doc != nil && doc.GetCaption() != "" {
 		return doc.GetCaption()
+	} else if proto := msg.GetProtocolMessage(); proto != nil {
+		if proto.GetType() == waProto.ProtocolMessage_MESSAGE_EDIT {
+			// Handle edited message content
+			if edited := proto.GetEditedMessage(); edited != nil {
+				if editedText := edited.GetConversation(); editedText != "" {
+					return "[EDITED] " + editedText
+				} else if editedExtText := edited.GetExtendedTextMessage(); editedExtText != nil {
+					return "[EDITED] " + editedExtText.GetText()
+				}
+			}
+		} else if proto.GetType() == waProto.ProtocolMessage_REVOKE {
+			// Handle revoked (deleted) message
+			return "[MESSAGE DELETED]"
+		}
 	}
 
 	// For now, we're ignoring non-text messages
@@ -553,6 +567,26 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		logger.Warnf("Failed to store chat: %v", err)
 	}
 
+	// Check if this is an edited or revoked message
+	isEditedMessage := false
+	isRevokedMessage := false
+	var originalMessageID string
+
+	if proto := msg.Message.GetProtocolMessage(); proto != nil {
+		if proto.GetKey() != nil {
+			originalMessageID = proto.GetKey().GetId()
+		}
+
+		switch proto.GetType() {
+		case waProto.ProtocolMessage_MESSAGE_EDIT:
+			isEditedMessage = true
+			logger.Infof("Processing edited message (original ID: %s)", originalMessageID)
+		case waProto.ProtocolMessage_REVOKE:
+			isRevokedMessage = true
+			logger.Infof("Processing revoked message (original ID: %s)", originalMessageID)
+		}
+	}
+
 	// Extract text content
 	content := extractTextContent(msg.Message)
 
@@ -562,61 +596,94 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Extract media info
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
 
-	// Skip if there's no content and no media
-	if content == "" && mediaType == "" {
-		fmt.Println("skip le", content, mediaType, msg.Message)
+	// Skip if there's no content and no media, unless it's a revoked message
+	if content == "" && mediaType == "" && !isRevokedMessage {
+		// Log edit message for debugging even if we skip it
+		if isEditedMessage {
+			logger.Infof("Skipping edited message with no content/media: %v", msg.Message)
+		} else {
+			fmt.Println("skip le", content, mediaType, msg.Message)
+		}
 		return
 	}
 
 	fmt.Println("processing message", content, mediaType, msg.Message)
 
-	// Store message in database
-	err = messageStore.StoreMessage(
-		msg.Info.ID,
-		chatJID,
-		sender,
-		content,
-		msg.Info.Timestamp,
-		msg.Info.IsFromMe,
-		mediaType,
-		filename,
-		url,
-		mediaKey,
-		fileSHA256,
-		fileEncSHA256,
-		fileLength,
-		quotedMessage,
-	)
-
-	if err != nil {
-		logger.Warnf("Failed to store message: %v", err)
+	// For edited or revoked messages, update the existing message instead of creating a new one
+	if (isEditedMessage || isRevokedMessage) && originalMessageID != "" {
+		if isRevokedMessage {
+			err = messageStore.MarkMessageAsDeleted(
+				originalMessageID,
+				chatJID,
+				msg.Info.Timestamp,
+			)
+			if err != nil {
+				logger.Warnf("Failed to mark message as deleted: %v", err)
+			} else {
+				logger.Infof("Successfully marked message as deleted (ID: %s)", originalMessageID)
+			}
+		} else if isEditedMessage {
+			err = messageStore.UpdateEditedMessage(
+				originalMessageID,
+				chatJID,
+				content,
+				msg.Info.Timestamp,
+			)
+			if err != nil {
+				logger.Warnf("Failed to update edited message: %v", err)
+			} else {
+				logger.Infof("Successfully updated edited message (ID: %s): %s", originalMessageID, content)
+			}
+		}
 	} else {
-		// Log message reception
-		timestamp := msg.Info.Timestamp.Format("2006-01-02 15:04:05")
-		direction := "←"
-		if msg.Info.IsFromMe {
-			direction = "→"
-		}
+		// Store message in database as a new message
+		err = messageStore.StoreMessage(
+			msg.Info.ID,
+			chatJID,
+			sender,
+			content,
+			msg.Info.Timestamp,
+			msg.Info.IsFromMe,
+			mediaType,
+			filename,
+			url,
+			mediaKey,
+			fileSHA256,
+			fileEncSHA256,
+			fileLength,
+			quotedMessage,
+		)
 
-		// Log based on message type
-		if mediaType != "" {
-			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
-		} else if content != "" {
-			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
-		}
+		if err != nil {
+			logger.Warnf("Failed to store message: %v", err)
+		} else {
+			// Log message reception
+			timestamp := msg.Info.Timestamp.Format("2006-01-02 15:04:05")
+			direction := "←"
+			if msg.Info.IsFromMe {
+				direction = "→"
+			}
 
-		// Log quoted message if present
-		if quotedMessage != "" {
-			fmt.Printf("  ↳ Reply to: %s\n", quotedMessage)
+			// Log based on message type
+			if mediaType != "" {
+				fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
+			} else if content != "" {
+				fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
+			}
+
+			// Log quoted message if present
+			if quotedMessage != "" {
+				fmt.Printf("  ↳ Reply to: %s\n", quotedMessage)
+			}
 		}
 	}
 
-	if msg.Info.IsFromMe {
+	if msg.Info.IsFromMe || isRevokedMessage {
 		return
 	}
 
 	// --- Webhook logic ---
-	// Only trigger webhook for incoming messages (not from the user)
+	// Only trigger webhook for incoming messages that are not revoked
 	webhookPayload := map[string]interface{}{
 		"id":             msg.Info.ID,
 		"chat_jid":       chatJID,
@@ -628,6 +695,10 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		"filename":       filename,
 		"url":            url,
 		"quoted_message": quotedMessage,
+		"is_edited":      isEditedMessage,
+	}
+	if isEditedMessage {
+		webhookPayload["original_message_id"] = originalMessageID
 	}
 	jsonPayload, err := json.Marshal(webhookPayload)
 	if err != nil {
@@ -2165,4 +2236,22 @@ func (store *MessageStore) FindMessageIDByFilename(chatJID string, filename stri
 	}
 
 	return "", fmt.Errorf("message ID is NULL")
+}
+
+// Update an edited message in the database
+func (store *MessageStore) UpdateEditedMessage(originalID, chatJID, content string, timestamp time.Time) error {
+	_, err := store.db.Exec(
+		"UPDATE messages SET content = ?, timestamp = ? WHERE id = ? AND chat_jid = ?",
+		content, timestamp, originalID, chatJID,
+	)
+	return err
+}
+
+// Mark a message as deleted in the database
+func (store *MessageStore) MarkMessageAsDeleted(originalID, chatJID string, timestamp time.Time) error {
+	_, err := store.db.Exec(
+		"UPDATE messages SET content = '[MESSAGE DELETED]', timestamp = ? WHERE id = ? AND chat_jid = ?",
+		timestamp, originalID, chatJID,
+	)
+	return err
 }
