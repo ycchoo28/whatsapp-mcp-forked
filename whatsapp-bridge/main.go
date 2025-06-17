@@ -37,12 +37,13 @@ import (
 
 // Message represents a chat message for our client
 type Message struct {
-	Time      time.Time
-	Sender    string
-	Content   string
-	IsFromMe  bool
-	MediaType string
-	Filename  string
+	Time          time.Time
+	Sender        string
+	Content       string
+	IsFromMe      bool
+	MediaType     string
+	Filename      string
+	QuotedMessage string
 }
 
 // SenderWhitelist holds the list of approved senders
@@ -88,6 +89,7 @@ func NewMessageStore() (*MessageStore, error) {
 			file_sha256 BLOB,
 			file_enc_sha256 BLOB,
 			file_length INTEGER,
+			quoted_message TEXT,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
@@ -116,7 +118,7 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
-	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64, quotedMessage string) error {
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
 		return nil
@@ -124,9 +126,9 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 
 	_, err := store.db.Exec(
 		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, quoted_message) 
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, quotedMessage,
 	)
 	return err
 }
@@ -134,7 +136,7 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 // Get messages from a chat
 func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, error) {
 	rows, err := store.db.Query(
-		"SELECT sender, content, timestamp, is_from_me, media_type, filename FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?",
+		"SELECT sender, content, timestamp, is_from_me, media_type, filename, quoted_message FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?",
 		chatJID, limit,
 	)
 	if err != nil {
@@ -146,11 +148,17 @@ func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, er
 	for rows.Next() {
 		var msg Message
 		var timestamp time.Time
-		err := rows.Scan(&msg.Sender, &msg.Content, &timestamp, &msg.IsFromMe, &msg.MediaType, &msg.Filename)
+		var quotedMessage sql.NullString
+		err := rows.Scan(&msg.Sender, &msg.Content, &timestamp, &msg.IsFromMe, &msg.MediaType, &msg.Filename, &quotedMessage)
 		if err != nil {
 			return nil, err
 		}
 		msg.Time = timestamp
+		if quotedMessage.Valid {
+			msg.QuotedMessage = quotedMessage.String
+		} else {
+			msg.QuotedMessage = ""
+		}
 		messages = append(messages, msg)
 	}
 
@@ -199,6 +207,56 @@ func extractTextContent(msg *waProto.Message) string {
 	}
 
 	// For now, we're ignoring non-text messages
+	return ""
+}
+
+// Extract quoted message content from a message
+func extractQuotedMessage(msg *waProto.Message) string {
+	if msg == nil {
+		return ""
+	}
+
+	// Check for extended text message with context info
+	if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
+		if ctx := extendedText.GetContextInfo(); ctx != nil && ctx.QuotedMessage != nil {
+			// Try to extract text from quoted message
+			quotedMsg := ctx.QuotedMessage
+
+			// Extract text based on message type
+			if text := quotedMsg.GetConversation(); text != "" {
+				return text
+			} else if extText := quotedMsg.GetExtendedTextMessage(); extText != nil {
+				return extText.GetText()
+			} else if img := quotedMsg.GetImageMessage(); img != nil && img.GetCaption() != "" {
+				return img.GetCaption()
+			} else if vid := quotedMsg.GetVideoMessage(); vid != nil && vid.GetCaption() != "" {
+				return vid.GetCaption()
+			} else if doc := quotedMsg.GetDocumentMessage(); doc != nil && doc.GetCaption() != "" {
+				return doc.GetCaption()
+			}
+
+			// If we couldn't extract text, return a placeholder based on the message type
+			if quotedMsg.GetImageMessage() != nil {
+				return "[Image]"
+			} else if quotedMsg.GetVideoMessage() != nil {
+				return "[Video]"
+			} else if quotedMsg.GetAudioMessage() != nil {
+				return "[Audio]"
+			} else if quotedMsg.GetDocumentMessage() != nil {
+				return "[Document]"
+			} else if quotedMsg.GetStickerMessage() != nil {
+				return "[Sticker]"
+			} else if quotedMsg.GetContactMessage() != nil {
+				return "[Contact]"
+			} else if quotedMsg.GetLocationMessage() != nil {
+				return "[Location]"
+			}
+
+			// Unknown message type
+			return "[Message]"
+		}
+	}
+
 	return ""
 }
 
@@ -498,6 +556,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Extract text content
 	content := extractTextContent(msg.Message)
 
+	// Extract quoted message content
+	quotedMessage := extractQuotedMessage(msg.Message)
+
 	// Extract media info
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
 
@@ -524,6 +585,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileSHA256,
 		fileEncSHA256,
 		fileLength,
+		quotedMessage,
 	)
 
 	if err != nil {
@@ -542,6 +604,11 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		} else if content != "" {
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
+
+		// Log quoted message if present
+		if quotedMessage != "" {
+			fmt.Printf("  ↳ Reply to: %s\n", quotedMessage)
+		}
 	}
 
 	if msg.Info.IsFromMe {
@@ -551,15 +618,16 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// --- Webhook logic ---
 	// Only trigger webhook for incoming messages (not from the user)
 	webhookPayload := map[string]interface{}{
-		"id":         msg.Info.ID,
-		"chat_jid":   chatJID,
-		"sender":     sender,
-		"content":    content,
-		"timestamp":  msg.Info.Timestamp,
-		"is_from_me": msg.Info.IsFromMe,
-		"media_type": mediaType,
-		"filename":   filename,
-		"url":        url,
+		"id":             msg.Info.ID,
+		"chat_jid":       chatJID,
+		"sender":         sender,
+		"content":        content,
+		"timestamp":      msg.Info.Timestamp,
+		"is_from_me":     msg.Info.IsFromMe,
+		"media_type":     mediaType,
+		"filename":       filename,
+		"url":            url,
+		"quoted_message": quotedMessage,
 	}
 	jsonPayload, err := json.Marshal(webhookPayload)
 	if err != nil {
@@ -607,16 +675,38 @@ func (store *MessageStore) StoreMediaInfo(id, chatJID, url string, mediaKey, fil
 
 // Get media info from the database
 func (store *MessageStore) GetMediaInfo(id, chatJID string) (string, string, string, []byte, []byte, []byte, uint64, error) {
-	var mediaType, filename, url string
+	var mediaType, filename sql.NullString
+	var url sql.NullString
 	var mediaKey, fileSHA256, fileEncSHA256 []byte
-	var fileLength uint64
+	var fileLength sql.NullInt64
 
 	err := store.db.QueryRow(
 		"SELECT media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length FROM messages WHERE id = ? AND chat_jid = ?",
 		id, chatJID,
 	).Scan(&mediaType, &filename, &url, &mediaKey, &fileSHA256, &fileEncSHA256, &fileLength)
 
-	return mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, err
+	// Convert nullable types to their non-nullable equivalents
+	mediaTypeStr := ""
+	if mediaType.Valid {
+		mediaTypeStr = mediaType.String
+	}
+
+	filenameStr := ""
+	if filename.Valid {
+		filenameStr = filename.String
+	}
+
+	urlStr := ""
+	if url.Valid {
+		urlStr = url.String
+	}
+
+	fileLengthVal := uint64(0)
+	if fileLength.Valid {
+		fileLengthVal = uint64(fileLength.Int64)
+	}
+
+	return mediaTypeStr, filenameStr, urlStr, mediaKey, fileSHA256, fileEncSHA256, fileLengthVal, err
 }
 
 // MediaDownloader implements the whatsmeow.DownloadableMessage interface
@@ -682,13 +772,22 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 
 	if err != nil {
 		// Try to get basic info if extended info isn't available
+		var mediaTypeNull, filenameNull sql.NullString
 		err = messageStore.db.QueryRow(
 			"SELECT media_type, filename FROM messages WHERE id = ? AND chat_jid = ?",
 			messageID, chatJID,
-		).Scan(&mediaType, &filename)
+		).Scan(&mediaTypeNull, &filenameNull)
 
 		if err != nil {
 			return false, "", "", "", fmt.Errorf("failed to find message: %v", err)
+		}
+
+		if mediaTypeNull.Valid {
+			mediaType = mediaTypeNull.String
+		}
+
+		if filenameNull.Valid {
+			filename = filenameNull.String
 		}
 	}
 
@@ -1668,6 +1767,12 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					}
 				}
 
+				// Extract quoted message content
+				var quotedMessage string
+				if msg.Message.Message != nil {
+					quotedMessage = extractQuotedMessage(msg.Message.Message)
+				}
+
 				// Extract media info
 				var mediaType, filename, url string
 				var mediaKey, fileSHA256, fileEncSHA256 []byte
@@ -1741,6 +1846,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					fileSHA256,
 					fileEncSHA256,
 					fileLength,
+					quotedMessage,
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)
@@ -2044,10 +2150,19 @@ func downloadImageFromURL(imageURL string) (string, error) {
 
 // Find message ID by chat_jid and filename
 func (store *MessageStore) FindMessageIDByFilename(chatJID string, filename string) (string, error) {
-	var messageID string
+	var messageID sql.NullString
 	err := store.db.QueryRow(
 		"SELECT id FROM messages WHERE chat_jid = ? AND filename = ? LIMIT 1",
 		chatJID, filename,
 	).Scan(&messageID)
-	return messageID, err
+
+	if err != nil {
+		return "", err
+	}
+
+	if messageID.Valid {
+		return messageID.String, nil
+	}
+
+	return "", fmt.Errorf("message ID is NULL")
 }

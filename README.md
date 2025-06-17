@@ -150,6 +150,65 @@ chmod +x test_api.sh
 
 The REST API is particularly useful for n8n workflows. You can use the `/api/messages` endpoint to retrieve WhatsApp messages and process them in your automated workflows.
 
+## Features
+
+- **WhatsApp Authentication**: Authenticate with WhatsApp using QR code scanning
+- **Message Handling**: Receive and store messages in a SQLite database
+- **Media Support**: Download and handle various media types (images, videos, documents, audio)
+- **REST API**: Access WhatsApp functionality through a REST API
+- **Reply Context**: Store and retrieve quoted message information when users reply to messages
+- **Webhook Integration**: Forward incoming messages to a configurable webhook URL
+- **Message Filtering**: Optional whitelist to process messages only from specific senders
+
+## API Endpoints
+
+### GET /api/messages
+
+Get messages from a specific chat.
+
+**Query Parameters**:
+- `chat_jid`: JID of the chat (required)
+- `limit`: Maximum number of messages to retrieve (default: 20)
+
+**Response**:
+```json
+{
+  "success": true,
+  "messages": [
+    {
+      "sender": "123456789",
+      "content": "Hello, world!",
+      "time": "2023-01-01T12:00:00Z",
+      "is_from_me": false,
+      "media_type": "",
+      "filename": "",
+      "quoted_message": "Previous message that was replied to"
+    }
+  ]
+}
+```
+
+### Webhook Payload
+
+When a message is received, a webhook is triggered with the following payload:
+
+```json
+{
+  "id": "MESSAGE_ID",
+  "chat_jid": "CHAT_JID",
+  "sender": "SENDER_NUMBER",
+  "content": "MESSAGE_CONTENT",
+  "timestamp": "2023-01-01T12:00:00Z",
+  "is_from_me": false,
+  "media_type": "MEDIA_TYPE",
+  "filename": "FILENAME",
+  "url": "MEDIA_URL",
+  "quoted_message": "QUOTED_MESSAGE_CONTENT"
+}
+```
+
+The `quoted_message` field contains the content of the message that was replied to, if applicable.
+
 ## Usage
 
 Once connected, you can interact with your WhatsApp contacts through Claude, leveraging Claude's AI capabilities in your WhatsApp conversations.
