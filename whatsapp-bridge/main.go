@@ -27,6 +27,7 @@ import (
 	"bytes"
 
 	"go.mau.fi/whatsmeow"
+	waBinary "go.mau.fi/whatsmeow/binary"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -540,185 +541,307 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 	return "", "", "", nil, nil, nil, 0
 }
 
+// formatOrderAsNaturalLanguage converts order details to a natural language string
+func formatOrderAsNaturalLanguage(node *waBinary.Node) string {
+	if node == nil {
+		return ""
+	}
+
+	// Find the order node in the response
+	var orderNode *waBinary.Node
+	for _, content := range node.GetChildren() {
+		if content.Tag == "order" {
+			orderNode = &content
+			break
+		}
+	}
+
+	if orderNode == nil {
+		return ""
+	}
+
+	var productName, quantity string
+
+	// Extract product information
+	for _, child := range orderNode.GetChildren() {
+		if child.Tag == "product" {
+			for _, productChild := range child.GetChildren() {
+				if productChild.Tag == "name" && productChild.Content != nil {
+					productName = string(productChild.Content.([]byte))
+				} else if productChild.Tag == "quantity" && productChild.Content != nil {
+					quantity = string(productChild.Content.([]byte))
+				}
+			}
+		}
+	}
+
+	// Set defaults if not found
+	if quantity == "" {
+		quantity = "1"
+	}
+
+	// Format the order in natural language
+	if productName != "" {
+		// Format: "我想购买: 全麦葡萄干核桃馒头 x1"
+		return fmt.Sprintf("我想购买: %s x%s", productName, quantity)
+	}
+
+	return ""
+}
+
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
 	// Save message to database
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
 
-	// If whitelist is enabled (non-empty) and this is not from the user,
-	// check if sender is in the whitelist
-	if len(SenderWhitelist) > 0 && !msg.Info.IsFromMe {
+	// Check whitelist
+	if !isWhitelistedOrSelf(msg.Info.IsFromMe, sender, logger) {
+		return
+	}
+
+	// Get chat name and update chat record
+	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
+	logger.Infof("Chat name: %s", name)
+	if err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp); err != nil {
+		logger.Warnf("Failed to store chat: %v", err)
+	}
+
+	// Check for special message types
+	isEditedMessage, isRevokedMessage, originalMessageID := checkSpecialMessageTypes(msg, logger)
+
+	// Extract message content and media info
+	content := extractTextContent(msg.Message)
+	quotedMessage := extractQuotedMessage(msg.Message)
+	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
+
+	// Process order message if present
+	isOrder, orderID, orderFormatted := processOrderMessage(client, msg.Message, &content, logger)
+
+	// Skip processing if no content to save
+	if shouldSkipMessage(content, mediaType, isRevokedMessage, isOrder, isEditedMessage, logger, msg.Message) {
+		return
+	}
+
+	fmt.Println("Processing message", content, mediaType)
+
+	// Handle edited or revoked messages
+	if (isEditedMessage || isRevokedMessage) && originalMessageID != "" {
+		handleEditedOrRevokedMessage(messageStore, isRevokedMessage, originalMessageID, chatJID, content, msg.Info.Timestamp, logger)
+	} else {
+		// Store new message
+		storeNewMessage(messageStore, msg.Info.ID, chatJID, sender, content, msg.Info.Timestamp,
+			msg.Info.IsFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256,
+			fileLength, quotedMessage, logger)
+	}
+
+	// Send webhook for incoming messages that are not from self and not revoked
+	if !msg.Info.IsFromMe && !isRevokedMessage {
+		sendWebhook(msg.Info.ID, chatJID, sender, content, msg.Info.Timestamp,
+			msg.Info.IsFromMe, mediaType, filename, url, quotedMessage,
+			isEditedMessage, originalMessageID, isOrder, orderID, orderFormatted, logger)
+	}
+}
+
+// Check if sender is whitelisted or message is from self
+func isWhitelistedOrSelf(isFromMe bool, sender string, logger waLog.Logger) bool {
+	if isFromMe {
+		return true
+	}
+
+	if len(SenderWhitelist) > 0 {
 		if !SenderWhitelist[sender] {
-			// Not in whitelist, ignore this message
 			logger.Infof("Ignoring message from non-whitelisted sender: %s", sender)
-			return
+			return false
 		}
 		logger.Infof("Processing whitelisted message from: %s", sender)
 	}
 
-	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
-	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
-	logger.Infof("name", name)
+	return true
+}
 
-	// Update chat in database with the message timestamp (keeps last message time updated)
-	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
-	if err != nil {
-		logger.Warnf("Failed to store chat: %v", err)
-	}
-
-	// Check if this is an edited or revoked message
-	isEditedMessage := false
-	isRevokedMessage := false
-	var originalMessageID string
-
+// Check for edited or revoked messages
+func checkSpecialMessageTypes(msg *events.Message, logger waLog.Logger) (isEdited bool, isRevoked bool, originalID string) {
 	if proto := msg.Message.GetProtocolMessage(); proto != nil {
 		if proto.GetKey() != nil {
-			originalMessageID = proto.GetKey().GetId()
+			originalID = proto.GetKey().GetId()
 		}
 
 		switch proto.GetType() {
 		case waProto.ProtocolMessage_MESSAGE_EDIT:
-			isEditedMessage = true
-			logger.Infof("Processing edited message (original ID: %s)", originalMessageID)
+			isEdited = true
+			logger.Infof("Processing edited message (original ID: %s)", originalID)
 		case waProto.ProtocolMessage_REVOKE:
-			isRevokedMessage = true
-			logger.Infof("Processing revoked message (original ID: %s)", originalMessageID)
+			isRevoked = true
+			logger.Infof("Processing revoked message (original ID: %s)", originalID)
 		}
 	}
 
-	// Extract text content
-	content := extractTextContent(msg.Message)
+	return isEdited, isRevoked, originalID
+}
 
-	// Extract quoted message content
-	quotedMessage := extractQuotedMessage(msg.Message)
+// Process order message and update content if needed
+func processOrderMessage(client *whatsmeow.Client, msg *waProto.Message, content *string, logger waLog.Logger) (bool, string, string) {
+	orderID, token, isOrder := ExtractOrderFromMessage(msg)
+	if !isOrder {
+		return false, "", ""
+	}
 
-	// Extract media info
-	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
+	logger.Infof("Detected order message with ID: %s", orderID)
 
-	// Skip if there's no content and no media, unless it's a revoked message
-	if content == "" && mediaType == "" && !isRevokedMessage {
+	// Get order details
+	orderDetails, err := GetOrderDetails(client, orderID, token)
+	if err != nil {
+		logger.Warnf("Failed to get order details: %v", err)
+		return true, orderID, ""
+	}
+
+	logger.Infof("Retrieved order details successfully")
+
+	// Format order as natural language
+	orderFormatted := formatOrderAsNaturalLanguage(orderDetails)
+	if orderFormatted != "" {
+		// If we have a formatted order string, append it to the message content
+		if *content != "" {
+			*content += "\n" + orderFormatted
+		} else {
+			*content = orderFormatted
+		}
+
+		logger.Infof("Formatted order: %s", orderFormatted)
+	}
+
+	return true, orderID, orderFormatted
+}
+
+// Determine if message should be skipped
+func shouldSkipMessage(content string, mediaType string, isRevokedMessage bool, isOrder bool, isEditedMessage bool, logger waLog.Logger, msg *waProto.Message) bool {
+	if content == "" && mediaType == "" && !isRevokedMessage && !isOrder {
 		// Log edit message for debugging even if we skip it
 		if isEditedMessage {
-			logger.Infof("Skipping edited message with no content/media: %v", msg.Message)
+			logger.Infof("Skipping edited message with no content/media: %v", msg)
 		} else {
-			fmt.Println("skip le", content, mediaType, msg.Message)
+			logger.Infof("Skipping message with no content/media")
 		}
-		return
+		return true
 	}
 
-	fmt.Println("processing message", content, mediaType, msg.Message)
+	return false
+}
 
-	// For edited or revoked messages, update the existing message instead of creating a new one
-	if (isEditedMessage || isRevokedMessage) && originalMessageID != "" {
-		if isRevokedMessage {
-			err = messageStore.MarkMessageAsDeleted(
-				originalMessageID,
-				chatJID,
-				msg.Info.Timestamp,
-			)
-			if err != nil {
-				logger.Warnf("Failed to mark message as deleted: %v", err)
-			} else {
-				logger.Infof("Successfully marked message as deleted (ID: %s)", originalMessageID)
-			}
-		} else if isEditedMessage {
-			err = messageStore.UpdateEditedMessage(
-				originalMessageID,
-				chatJID,
-				content,
-				msg.Info.Timestamp,
-			)
-			if err != nil {
-				logger.Warnf("Failed to update edited message: %v", err)
-			} else {
-				logger.Infof("Successfully updated edited message (ID: %s): %s", originalMessageID, content)
-			}
+// Handle edited or revoked messages
+func handleEditedOrRevokedMessage(messageStore *MessageStore, isRevokedMessage bool, originalID string, chatJID string, content string, timestamp time.Time, logger waLog.Logger) {
+	var err error
+
+	if isRevokedMessage {
+		err = messageStore.MarkMessageAsDeleted(originalID, chatJID, timestamp)
+		if err != nil {
+			logger.Warnf("Failed to mark message as deleted: %v", err)
+		} else {
+			logger.Infof("Successfully marked message as deleted (ID: %s)", originalID)
 		}
 	} else {
-		// Store message in database as a new message
-		err = messageStore.StoreMessage(
-			msg.Info.ID,
-			chatJID,
-			sender,
-			content,
-			msg.Info.Timestamp,
-			msg.Info.IsFromMe,
-			mediaType,
-			filename,
-			url,
-			mediaKey,
-			fileSHA256,
-			fileEncSHA256,
-			fileLength,
-			quotedMessage,
-		)
-
+		// Must be an edited message
+		err = messageStore.UpdateEditedMessage(originalID, chatJID, content, timestamp)
 		if err != nil {
-			logger.Warnf("Failed to store message: %v", err)
+			logger.Warnf("Failed to update edited message: %v", err)
 		} else {
-			// Log message reception
-			timestamp := msg.Info.Timestamp.Format("2006-01-02 15:04:05")
-			direction := "←"
-			if msg.Info.IsFromMe {
-				direction = "→"
-			}
-
-			// Log based on message type
-			if mediaType != "" {
-				fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
-			} else if content != "" {
-				fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
-			}
-
-			// Log quoted message if present
-			if quotedMessage != "" {
-				fmt.Printf("  ↳ Reply to: %s\n", quotedMessage)
-			}
+			logger.Infof("Successfully updated edited message (ID: %s): %s", originalID, content)
 		}
 	}
+}
 
-	if msg.Info.IsFromMe || isRevokedMessage {
+// Store a new message in the database and log it
+func storeNewMessage(messageStore *MessageStore, msgID string, chatJID string, sender string, content string,
+	timestamp time.Time, isFromMe bool, mediaType string, filename string, url string, mediaKey []byte,
+	fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64, quotedMessage string, logger waLog.Logger) {
+
+	err := messageStore.StoreMessage(
+		msgID, chatJID, sender, content, timestamp, isFromMe,
+		mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, quotedMessage,
+	)
+
+	if err != nil {
+		logger.Warnf("Failed to store message: %v", err)
 		return
 	}
 
-	// --- Webhook logic ---
-	// Only trigger webhook for incoming messages that are not revoked
+	// Log message reception
+	logTime := timestamp.Format("2006-01-02 15:04:05")
+	direction := "←"
+	if isFromMe {
+		direction = "→"
+	}
+
+	// Log based on message type
+	if mediaType != "" {
+		logger.Infof("[%s] %s %s: [%s: %s] %s", logTime, direction, sender, mediaType, filename, content)
+	} else if content != "" {
+		logger.Infof("[%s] %s %s: %s", logTime, direction, sender, content)
+	}
+
+	// Log quoted message if present
+	if quotedMessage != "" {
+		logger.Infof("  ↳ Reply to: %s", quotedMessage)
+	}
+}
+
+// Send webhook notification
+func sendWebhook(msgID string, chatJID string, sender string, content string, timestamp time.Time,
+	isFromMe bool, mediaType string, filename string, url string, quotedMessage string,
+	isEditedMessage bool, originalMessageID string, isOrder bool, orderID string, orderFormatted string, logger waLog.Logger) {
+
+	// Prepare webhook payload
 	webhookPayload := map[string]interface{}{
-		"id":             msg.Info.ID,
+		"id":             msgID,
 		"chat_jid":       chatJID,
 		"sender":         sender,
 		"content":        content,
-		"timestamp":      msg.Info.Timestamp,
-		"is_from_me":     msg.Info.IsFromMe,
+		"timestamp":      timestamp,
+		"is_from_me":     isFromMe,
 		"media_type":     mediaType,
 		"filename":       filename,
 		"url":            url,
 		"quoted_message": quotedMessage,
 		"is_edited":      isEditedMessage,
 	}
+
+	// Add order details to webhook payload if available
+	if isOrder {
+		webhookPayload["is_order"] = true
+		webhookPayload["order_id"] = orderID
+		if orderFormatted != "" {
+			webhookPayload["order_formatted"] = orderFormatted
+		}
+	}
+
 	if isEditedMessage {
 		webhookPayload["original_message_id"] = originalMessageID
 	}
+
+	// Marshal payload to JSON
 	jsonPayload, err := json.Marshal(webhookPayload)
 	if err != nil {
 		logger.Warnf("Failed to marshal webhook payload: %v", err)
 		return
 	}
 
+	// Get webhook URL from environment
 	webhookURL := os.Getenv("WEBHOOK_URL")
-	if webhookURL != "" {
-		resp, err := http.Post(webhookURL, "application/json", bytes.NewBuffer(jsonPayload))
-		if err != nil {
-			logger.Warnf("Failed to POST to webhook %s: %v", webhookURL, err)
-		} else {
-			_ = resp.Body.Close()
-			fmt.Println("webhookURL sent", webhookURL)
-			logger.Infof("Sent to webhook %s", webhookURL)
-		}
-	} else {
+	if webhookURL == "" {
 		logger.Warnf("WEBHOOK_URL is not set")
+		return
 	}
+
+	// Send webhook request
+	resp, err := http.Post(webhookURL, "application/json", bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		logger.Warnf("Failed to POST to webhook %s: %v", webhookURL, err)
+		return
+	}
+
+	defer resp.Body.Close()
+	logger.Infof("Sent to webhook %s", webhookURL)
 }
 
 // DownloadMediaRequest represents the request body for the download media API
@@ -2254,4 +2377,257 @@ func (store *MessageStore) MarkMessageAsDeleted(originalID, chatJID string, time
 		timestamp, originalID, chatJID,
 	)
 	return err
+}
+
+// InfoQueryType represents the type of IQ query
+type InfoQueryType string
+
+const (
+	// GetInfoQuery represents a "get" IQ query
+	GetInfoQuery InfoQueryType = "get"
+	// SetInfoQuery represents a "set" IQ query
+	SetInfoQuery InfoQueryType = "set"
+	// ResultInfoQuery represents a "result" IQ query
+	ResultInfoQuery InfoQueryType = "result"
+)
+
+// InfoQuery represents a WhatsApp IQ query
+type InfoQuery struct {
+	Namespace string
+	Type      InfoQueryType
+	To        types.JID
+	Target    types.JID
+	ID        string
+	SmaxId    string
+	Content   []waBinary.Node
+}
+
+// generateRequestID creates a unique request ID for IQ queries
+func generateRequestID() string {
+	return fmt.Sprintf("%d.%d%d", time.Now().Unix(), rand.Intn(1000), rand.Intn(1000))
+}
+
+// sendIQ sends an IQ query and waits for the response
+func sendIQ(client *whatsmeow.Client, query InfoQuery) (*waBinary.Node, error) {
+	// If no ID is set, generate one
+	if len(query.ID) == 0 {
+		query.ID = generateRequestID()
+	}
+
+	// Prepare the attributes for the IQ node
+	attrs := waBinary.Attrs{
+		"id":    query.ID,
+		"xmlns": query.Namespace,
+		"type":  string(query.Type),
+	}
+
+	// Add smax_id if provided
+	if len(query.SmaxId) > 0 {
+		attrs["smax_id"] = query.SmaxId
+	}
+
+	// Add 'to' attribute if JID is not empty
+	if !query.To.IsEmpty() {
+		attrs["to"] = query.To
+	}
+
+	// Add 'target' attribute if JID is not empty
+	if !query.Target.IsEmpty() {
+		attrs["target"] = query.Target
+	}
+
+	// Create the IQ node
+	node := waBinary.Node{
+		Tag:     "iq",
+		Attrs:   attrs,
+		Content: query.Content,
+	}
+
+	// Register a response waiter before sending the request
+	respChan := client.DangerousInternals().WaitResponse(query.ID)
+
+	// Send the node
+	err := client.DangerousInternals().SendNode(node)
+	if err != nil {
+		client.DangerousInternals().CancelResponse(query.ID, respChan)
+		return nil, fmt.Errorf("failed to send IQ query: %v", err)
+	}
+
+	// Wait for response
+	select {
+	case resp := <-respChan:
+		return resp, nil
+	case <-time.After(30 * time.Second):
+		client.DangerousInternals().CancelResponse(query.ID, respChan)
+		return nil, fmt.Errorf("timeout waiting for IQ response")
+	}
+}
+
+// GetOrderDetails retrieves the details of an order by its ID and token
+func GetOrderDetails(client *whatsmeow.Client, orderID, tokenBase64 string) (*waBinary.Node, error) {
+	// Create order content nodes
+	imageDimensionsContent := []waBinary.Node{
+		{
+			Tag:     "width",
+			Content: []byte("100"),
+		},
+		{
+			Tag:     "height",
+			Content: []byte("100"),
+		},
+	}
+
+	// Create the image dimensions node
+	imageDimensionsNode := waBinary.Node{
+		Tag:     "image_dimensions",
+		Content: imageDimensionsContent,
+	}
+
+	// Create the token node
+	tokenNode := waBinary.Node{
+		Tag:     "token",
+		Content: []byte(tokenBase64),
+	}
+
+	// Create the order node
+	orderNode := waBinary.Node{
+		Tag: "order",
+		Attrs: waBinary.Attrs{
+			"op": "get",
+			"id": orderID,
+		},
+		Content: []waBinary.Node{imageDimensionsNode, tokenNode},
+	}
+
+	// Prepare the IQ query
+	query := InfoQuery{
+		Namespace: "fb:thrift_iq",
+		Type:      GetInfoQuery,
+		To:        types.ServerJID,
+		SmaxId:    "5", // Fixed value for order details
+		Content:   []waBinary.Node{orderNode},
+	}
+
+	// Send the IQ query and get the response
+	response, err := sendIQ(client, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get order details: %v", err)
+	}
+
+	// Log the raw response for debugging
+	fmt.Printf("Order details raw response: %+v\n", response)
+
+	// Decode and print human-readable order details
+	decodeOrderDetails(response)
+
+	return response, nil
+}
+
+// decodeOrderDetails parses a binary node response and prints human-readable order details
+func decodeOrderDetails(node *waBinary.Node) {
+	if node == nil {
+		fmt.Println("No order details to decode")
+		return
+	}
+
+	// Find the order node in the response
+	var orderNode *waBinary.Node
+	for _, content := range node.GetChildren() {
+		if content.Tag == "order" {
+			orderNode = &content
+			break
+		}
+	}
+
+	if orderNode == nil {
+		fmt.Println("Order node not found in response")
+		return
+	}
+
+	// Print order basic info
+	fmt.Println("\n===== ORDER DETAILS =====")
+	fmt.Printf("Order ID: %s\n", orderNode.AttrGetter().String("id"))
+	fmt.Printf("Creation Timestamp: %s\n", orderNode.AttrGetter().String("creation_ts"))
+
+	// Find product info
+	for _, child := range orderNode.GetChildren() {
+		if child.Tag == "product" {
+			fmt.Println("\n--- PRODUCT INFO ---")
+
+			// Extract product ID
+			for _, productChild := range child.GetChildren() {
+				if productChild.Tag == "id" {
+					productID := string(productChild.Content.([]byte))
+					fmt.Printf("Product ID: %s\n", productID)
+				} else if productChild.Tag == "name" {
+					productName := string(productChild.Content.([]byte))
+					fmt.Printf("Product Name: %s\n", productName)
+				} else if productChild.Tag == "price" {
+					price := string(productChild.Content.([]byte))
+					fmt.Printf("Price: %s\n", price)
+				} else if productChild.Tag == "currency" {
+					currency := string(productChild.Content.([]byte))
+					fmt.Printf("Currency: %s\n", currency)
+				} else if productChild.Tag == "quantity" {
+					quantity := string(productChild.Content.([]byte))
+					fmt.Printf("Quantity: %s\n", quantity)
+				} else if productChild.Tag == "image" {
+					fmt.Println("--- IMAGE INFO ---")
+					for _, imageChild := range productChild.GetChildren() {
+						if imageChild.Tag == "url" && imageChild.Content != nil {
+							imageURL := string(imageChild.Content.([]byte))
+							fmt.Printf("Image URL: %s\n", imageURL)
+						} else if imageChild.Tag == "id" && imageChild.Content != nil {
+							imageID := string(imageChild.Content.([]byte))
+							fmt.Printf("Image ID: %s\n", imageID)
+						}
+					}
+				}
+			}
+		} else if child.Tag == "catalog" {
+			fmt.Println("\n--- CATALOG INFO ---")
+			for _, catalogChild := range child.GetChildren() {
+				if catalogChild.Tag == "id" && catalogChild.Content != nil {
+					catalogID := string(catalogChild.Content.([]byte))
+					fmt.Printf("Catalog ID: %s\n", catalogID)
+				}
+			}
+		} else if child.Tag == "price" {
+			fmt.Println("\n--- PRICE DETAILS ---")
+			for _, priceChild := range child.GetChildren() {
+				if priceChild.Content != nil {
+					fmt.Printf("%s: %s\n", priceChild.Tag, string(priceChild.Content.([]byte)))
+				}
+			}
+		}
+	}
+
+	fmt.Println("========================\n")
+}
+
+// ExtractOrderFromMessage attempts to extract order details from a message
+// This function can be used to detect when a message contains an order
+// and extract the relevant information needed to retrieve order details.
+//
+// Usage example:
+//
+//	orderID, token, isOrder := ExtractOrderFromMessage(msg.Message)
+//	if isOrder {
+//	    orderDetails, err := GetOrderDetails(client, orderID, token)
+//	    // Process order details...
+//	}
+func ExtractOrderFromMessage(msg *waProto.Message) (orderID string, token string, ok bool) {
+	if msg == nil {
+		return "", "", false
+	}
+
+	// Check for order message
+	if orderMsg := msg.GetOrderMessage(); orderMsg != nil {
+		// Extract order ID and token
+		if orderMsg.OrderID != nil && orderMsg.Token != nil {
+			return *orderMsg.OrderID, *orderMsg.Token, true
+		}
+	}
+
+	return "", "", false
 }
