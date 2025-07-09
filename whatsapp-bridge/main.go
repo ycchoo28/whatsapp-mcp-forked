@@ -560,30 +560,41 @@ func formatOrderAsNaturalLanguage(node *waBinary.Node) string {
 		return ""
 	}
 
-	var productName, quantity string
+	type productInfo struct {
+		name     string
+		quantity string
+	}
+	var products []productInfo
 
 	// Extract product information
 	for _, child := range orderNode.GetChildren() {
 		if child.Tag == "product" {
+			var p productInfo
 			for _, productChild := range child.GetChildren() {
 				if productChild.Tag == "name" && productChild.Content != nil {
-					productName = string(productChild.Content.([]byte))
+					p.name = string(productChild.Content.([]byte))
 				} else if productChild.Tag == "quantity" && productChild.Content != nil {
-					quantity = string(productChild.Content.([]byte))
+					p.quantity = string(productChild.Content.([]byte))
 				}
+			}
+			// Set defaults if not found
+			if p.quantity == "" {
+				p.quantity = "1"
+			}
+			if p.name != "" {
+				products = append(products, p)
 			}
 		}
 	}
 
-	// Set defaults if not found
-	if quantity == "" {
-		quantity = "1"
-	}
-
 	// Format the order in natural language
-	if productName != "" {
-		// Format: "我想购买: 全麦葡萄干核桃馒头 x1"
-		return fmt.Sprintf("我想购买: %s x%s", productName, quantity)
+	if len(products) > 0 {
+		var productStrings []string
+		for _, p := range products {
+			productStrings = append(productStrings, fmt.Sprintf("%s x%s", p.name, p.quantity))
+		}
+		// Format: "我想购买: 全麦葡萄干核桃馒头 x1, 奶香芋泥馒 x1"
+		return fmt.Sprintf("我想购买: %s", strings.Join(productStrings, ", "))
 	}
 
 	return ""
