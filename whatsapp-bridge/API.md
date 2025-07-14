@@ -220,9 +220,36 @@ The endpoint will:
 4. Return the base64-encoded file data
 5. Automatically delete any files it downloaded (regardless of the delete_after_send parameter)
 
+### 6. Get PDF Document
+
+Retrieve a PDF document directly. This endpoint is useful for serving or downloading PDF files.
+
+**Endpoint:** `GET /api/get-pdf` or `POST /api/get-pdf`
+
+**Parameters:**
+- `chat_jid` (required): The JID of the chat where the document is located
+- `filename` (required): The filename of the document to retrieve
+- `delete_after_send` (optional): Set to "true", "1", or "yes" to delete the file after sending the response
+
+**Example:**
+```
+GET /api/get-pdf?chat_jid=1234567890@s.whatsapp.net&filename=document.pdf
+```
+
+**Success Response:**
+The endpoint returns the raw PDF file with the `Content-Type` header set to `application/pdf` and a `Content-Disposition` header to prompt a download.
+
+**Error Responses:**
+- `400 Bad Request` - Missing required parameters
+- `404 Not Found` - File not found and unable to locate message in database
+- `500 Internal Server Error` - Failed to download, read, or send the file
+
+**Auto-download Feature:**
+This endpoint shares the same auto-download logic as `/api/image-base64`. If the file is not found locally, it will attempt to download it from WhatsApp servers before serving it.
+
 ## Using with n8n Workflows
 
-The `/api/messages` endpoint is particularly useful for n8n workflows to retrieve WhatsApp messages directly from the backend:
+The WhatsApp Bridge can be integrated with n8n in two primary ways:
 
 1. Use an HTTP Request node in n8n
 2. Set the Method to GET

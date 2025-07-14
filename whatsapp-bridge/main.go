@@ -1665,6 +1665,130 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		}
 	})
 
+	// Handler for getting a PDF file directly
+	http.HandleFunc("/api/get-pdf", func(w http.ResponseWriter, r *http.Request) {
+		logger.Infof("Received request for /api/get-pdf from %s", r.RemoteAddr)
+
+		// Allow both GET and POST requests
+		if r.Method != http.MethodGet && r.Method != http.MethodPost {
+			logger.Warnf("Method not allowed: %s", r.Method)
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Get parameters either from query string (GET) or request body (POST)
+		var chatJID, filename string
+		var deleteAfterSend bool
+
+		if r.Method == http.MethodGet {
+			chatJID = r.URL.Query().Get("chat_jid")
+			filename = r.URL.Query().Get("filename")
+			deleteParam := r.URL.Query().Get("delete_after_send")
+			deleteAfterSend = deleteParam == "true" || deleteParam == "1" || deleteParam == "yes"
+			logger.Debugf("GET request parameters - chat_jid: %s, filename: %s, delete_after_send: %v", chatJID, filename, deleteAfterSend)
+		} else {
+			// Parse POST body
+			if err := r.ParseForm(); err != nil {
+				logger.Errorf("Failed to parse form data: %v", err)
+				http.Error(w, fmt.Sprintf("Failed to parse form data: %v", err), http.StatusBadRequest)
+				return
+			}
+			chatJID = r.FormValue("chat_jid")
+			filename = r.FormValue("filename")
+			deleteParam := r.FormValue("delete_after_send")
+			deleteAfterSend = deleteParam == "true" || deleteParam == "1" || deleteParam == "yes"
+			logger.Debugf("POST request parameters - chat_jid: %s, filename: %s, delete_after_send: %v", chatJID, filename, deleteAfterSend)
+		}
+
+		// Validate parameters
+		if chatJID == "" || filename == "" {
+			logger.Warnf("Missing required parameters - chat_jid: %s, filename: %s", chatJID, filename)
+			http.Error(w, "chat_jid and filename are required parameters", http.StatusBadRequest)
+			return
+		}
+
+		// Sanitize the chat JID for use in a path
+		sanitizedChatJID := strings.ReplaceAll(chatJID, ":", "_")
+
+		// Construct the path where the file should be
+		chatDir := fmt.Sprintf("store/%s", sanitizedChatJID)
+		filePath := filepath.Join(chatDir, filename)
+		logger.Debugf("Looking for file at path: %s", filePath)
+
+		// Track if the file was downloaded just for this request
+		wasDownloadedForThisRequest := false
+
+		// Check if file exists
+		fileExists := true
+		if _, err := os.Stat(filePath); os.IsNotExist(err) {
+			logger.Warnf("File not found at path: %s, will attempt to download", filePath)
+			fileExists = false
+
+			// Try to find the message ID in the database
+			messageID, err := messageStore.FindMessageIDByFilename(chatJID, filename)
+			if err != nil {
+				logger.Errorf("Failed to find message ID for file %s in chat %s: %v", filename, chatJID, err)
+				http.Error(w, fmt.Sprintf("File not found and unable to locate message in database: %v", err), http.StatusNotFound)
+				return
+			}
+
+			logger.Infof("Found message ID %s for file %s, attempting to download", messageID, filename)
+
+			// Try to download the file
+			success, _, _, downloadedPath, err := downloadMedia(client, messageStore, messageID, chatJID)
+			if err != nil || !success {
+				errMsg := "Unknown error"
+				if err != nil {
+					errMsg = err.Error()
+				}
+				logger.Errorf("Failed to download file: %s", errMsg)
+				http.Error(w, fmt.Sprintf("Failed to download file: %s", errMsg), http.StatusInternalServerError)
+				return
+			}
+
+			logger.Infof("Successfully downloaded file to %s", downloadedPath)
+			filePath = downloadedPath
+			fileExists = true
+			wasDownloadedForThisRequest = true
+		}
+
+		// At this point, we should have the file either already existed or was downloaded
+		if !fileExists {
+			logger.Warnf("File still not available after download attempt: %s", filePath)
+			http.Error(w, "File could not be retrieved", http.StatusInternalServerError)
+			return
+		}
+
+		// Read the file
+		fileData, err := os.ReadFile(filePath)
+		if err != nil {
+			logger.Errorf("Failed to read file %s: %v", filePath, err)
+			http.Error(w, fmt.Sprintf("Failed to read file: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		// Set headers and send the file
+		w.Header().Set("Content-Type", "application/pdf")
+		w.Header().Set("Content-Disposition", "attachment; filename=\""+filename+"\"")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(fileData)))
+
+		if _, err := w.Write(fileData); err != nil {
+			logger.Errorf("Failed to write PDF file to response: %v", err)
+		} else {
+			logger.Infof("Successfully sent PDF file %s", filename)
+		}
+
+		// Delete the file if requested or if it was downloaded just for this request
+		if deleteAfterSend || wasDownloadedForThisRequest {
+			logger.Infof("Deleting file after sending response: %s", filePath)
+			if err := os.Remove(filePath); err != nil {
+				logger.Errorf("Failed to delete file %s: %v", filePath, err)
+			} else {
+				logger.Infof("Successfully deleted file: %s", filePath)
+			}
+		}
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf("0.0.0.0:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
