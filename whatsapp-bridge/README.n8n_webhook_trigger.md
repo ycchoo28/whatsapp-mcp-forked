@@ -1,9 +1,10 @@
 # WhatsApp Bridge Webhook Feature
 
-This feature allows you to forward every incoming WhatsApp message to an external HTTP endpoint (webhook) as a JSON POST request.
+This feature allows you to forward incoming WhatsApp messages from individual chats to an external HTTP endpoint (webhook) as a JSON POST request.
 
 ## How it works
 - Every time a new WhatsApp message is received, the bridge will send a POST request to the URL specified in the `WEBHOOK_URL` environment variable.
+- **Messages from group chats will not trigger a webhook.**
 - The payload contains details about the message, including text, media info, sender, and timestamp.
 
 ## Configuration

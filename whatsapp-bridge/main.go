@@ -646,8 +646,8 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			fileLength, quotedMessage, logger)
 	}
 
-	// Send webhook for incoming messages that are not from self and not revoked
-	if !msg.Info.IsFromMe && !isRevokedMessage {
+	// Send webhook for incoming messages that are not from self, not group messages, and not revoked
+	if !msg.Info.IsFromMe && !isRevokedMessage && !msg.Info.IsGroup {
 		sendWebhook(msg.Info.ID, chatJID, sender, content, msg.Info.Timestamp,
 			msg.Info.IsFromMe, mediaType, filename, url, quotedMessage,
 			isEditedMessage, originalMessageID, isOrder, orderID, orderFormatted, logger)
