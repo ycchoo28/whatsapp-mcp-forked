@@ -5,6 +5,7 @@ This feature allows you to forward incoming WhatsApp messages from individual ch
 ## How it works
 - Every time a new WhatsApp message is received, the bridge will send a POST request to the URL specified in the `WEBHOOK_URL` environment variable.
 - **Messages from group chats will not trigger a webhook.**
+- **Messages from @lid JIDs will not trigger a webhook.**
 - The payload contains details about the message, including text, media info, sender, and timestamp.
 
 ## Configuration
@@ -42,6 +43,13 @@ WHATSAPP_WHITELIST=
 # Process messages only from these two numbers
 WHATSAPP_WHITELIST=1234567890,9876543210
 ```
+
+## JID Types and Filtering
+WhatsApp uses different JID (Jabber ID) formats for different types of contacts:
+
+- `@s.whatsapp.net`: Regular user accounts (these will trigger webhooks if not filtered by other rules)
+- `@g.us`: Group chats (these will not trigger webhooks)
+- `@lid`: Special accounts/contacts (these will not trigger webhooks)
 
 ## Payload Format
 The webhook will receive a JSON object like this:

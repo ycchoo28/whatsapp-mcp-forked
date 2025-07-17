@@ -646,8 +646,8 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			fileLength, quotedMessage, logger)
 	}
 
-	// Send webhook for incoming messages that are not from self, not group messages, and not revoked
-	if !msg.Info.IsFromMe && !isRevokedMessage && !msg.Info.IsGroup {
+	// Send webhook for eligible messages
+	if isEligibleForWebhook(msg, chatJID, isRevokedMessage, logger) {
 		sendWebhook(msg.Info.ID, chatJID, sender, content, msg.Info.Timestamp,
 			msg.Info.IsFromMe, mediaType, filename, url, quotedMessage,
 			isEditedMessage, originalMessageID, isOrder, orderID, orderFormatted, logger)
@@ -2765,4 +2765,30 @@ func ExtractOrderFromMessage(msg *waProto.Message) (orderID string, token string
 	}
 
 	return "", "", false
+}
+
+// Check if a message is eligible for webhook notification
+func isEligibleForWebhook(msg *events.Message, chatJID string, isRevokedMessage bool, logger waLog.Logger) bool {
+	// Don't send webhook for messages from self
+	if msg.Info.IsFromMe {
+		return false
+	}
+	
+	// Don't send webhook for revoked messages
+	if isRevokedMessage {
+		return false
+	}
+	
+	// Don't send webhook for group messages
+	if msg.Info.IsGroup {
+		return false
+	}
+	
+	// Don't send webhook for @lid JIDs
+	if strings.HasSuffix(chatJID, "@lid") {
+		logger.Infof("Skipping webhook for message from @lid JID: %s", chatJID)
+		return false
+	}
+	
+	return true
 }
