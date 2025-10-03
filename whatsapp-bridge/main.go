@@ -38,6 +38,7 @@ import (
 
 // Message represents a chat message for our client
 type Message struct {
+	ID            string
 	Time          time.Time
 	Sender        string
 	Content       string
@@ -137,7 +138,7 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 // Get messages from a chat
 func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, error) {
 	rows, err := store.db.Query(
-		"SELECT sender, content, timestamp, is_from_me, media_type, filename, quoted_message FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?",
+		"SELECT id, sender, content, timestamp, is_from_me, media_type, filename, quoted_message FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?",
 		chatJID, limit,
 	)
 	if err != nil {
@@ -150,7 +151,7 @@ func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, er
 		var msg Message
 		var timestamp time.Time
 		var quotedMessage sql.NullString
-		err := rows.Scan(&msg.Sender, &msg.Content, &timestamp, &msg.IsFromMe, &msg.MediaType, &msg.Filename, &quotedMessage)
+		err := rows.Scan(&msg.ID, &msg.Sender, &msg.Content, &timestamp, &msg.IsFromMe, &msg.MediaType, &msg.Filename, &quotedMessage)
 		if err != nil {
 			return nil, err
 		}
